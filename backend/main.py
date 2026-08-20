@@ -53,6 +53,7 @@ def load_job(job_id: str) -> dict:
 # ----- Request/Response models -----
 class ClusterRequest(BaseModel):
     text: str
+    enable_caller_tune: bool = False
 
 class ClusterResponse(BaseModel):
     job_id: str
@@ -79,17 +80,30 @@ async def cluster_audio(request: ClusterRequest):
         raise HTTPException(status_code=400, detail="No valid .wav URLs found in input.")
         
     # Phase 2-5: Pipeline (now returns clusters + errors)
-    clusters, errors = await run_pipeline(urls)
+    clusters, errors, caller_tune_idx = await run_pipeline(urls, enable_yamnet=request.enable_caller_tune)
     
+    ct_cluster = None
+    if caller_tune_idx is not None:
+        ct_cluster = clusters[caller_tune_idx]
+        
     # Sort clusters by size descending
     clusters.sort(key=len, reverse=True)
     
     # Store job
     job_id = str(uuid.uuid4())[:8]
+    
+    labels = {}
+    if ct_cluster is not None:
+        try:
+            new_ct_idx = clusters.index(ct_cluster)
+            labels[str(new_ct_idx)] = "Caller Tunes"
+        except ValueError:
+            pass
+            
     jobs[job_id] = {
         "clusters": clusters,
         "errors": errors,
-        "labels": {},
+        "labels": labels,
         "total_urls": len(urls)
     }
     save_job(job_id)
@@ -120,7 +134,7 @@ async def cluster_audio_stream(request: ClusterRequest):
     
     async def event_generator():
         # Start the pipeline in a background task
-        task = asyncio.create_task(run_pipeline(urls, progress_callback=progress_callback))
+        task = asyncio.create_task(run_pipeline(urls, progress_callback=progress_callback, enable_yamnet=request.enable_caller_tune))
         
         # Keep yielding progress events until pipeline completes
         while not task.done():
@@ -137,15 +151,28 @@ async def cluster_audio_stream(request: ClusterRequest):
             yield event
         
         # Get result
-        clusters, errors = task.result()
+        clusters, errors, caller_tune_idx = task.result()
+        
+        ct_cluster = None
+        if caller_tune_idx is not None:
+            ct_cluster = clusters[caller_tune_idx]
+            
         clusters.sort(key=len, reverse=True)
         
-        # Store job
         job_id = str(uuid.uuid4())[:8]
+        
+        labels = {}
+        if ct_cluster is not None:
+            try:
+                new_ct_idx = clusters.index(ct_cluster)
+                labels[str(new_ct_idx)] = "Caller Tunes"
+            except ValueError:
+                pass
+        
         jobs[job_id] = {
             "clusters": clusters,
             "errors": errors,
-            "labels": {},
+            "labels": labels,
             "total_urls": len(urls)
         }
         save_job(job_id)
@@ -157,6 +184,7 @@ async def cluster_audio_stream(request: ClusterRequest):
                 "job_id": job_id,
                 "clusters": clusters,
                 "errors": errors,
+                "labels": labels,
                 "total_urls": len(urls)
             })
         }
@@ -165,8 +193,12 @@ async def cluster_audio_stream(request: ClusterRequest):
 
 
 @app.post("/api/upload-excel-stream")
-async def upload_excel_stream(file: UploadFile = File(...)):
+async def upload_excel_stream(
+    file: UploadFile = File(...),
+    enable_caller_tune: str = "false"
+):
     """Upload an Excel file and stream progress via SSE."""
+    is_caller_tune_enabled = enable_caller_tune.lower() == "true"
     try:
         contents = await file.read()
         df = pd.read_excel(io.BytesIO(contents))
@@ -204,7 +236,7 @@ async def upload_excel_stream(file: UploadFile = File(...)):
         })
     
     async def event_generator():
-        task = asyncio.create_task(run_pipeline(urls, progress_callback=progress_callback))
+        task = asyncio.create_task(run_pipeline(urls, progress_callback=progress_callback, enable_yamnet=is_caller_tune_enabled))
         
         while not task.done():
             try:
@@ -217,13 +249,27 @@ async def upload_excel_stream(file: UploadFile = File(...)):
             event = await queue.get()
             yield event
         
-        clusters, errors = task.result()
+        clusters, errors, caller_tune_idx = task.result()
+        
+        ct_cluster = None
+        if caller_tune_idx is not None:
+            ct_cluster = clusters[caller_tune_idx]
+            
         clusters.sort(key=len, reverse=True)
         
         job_id = str(uuid.uuid4())[:8]
+        
+        labels = {}
+        if ct_cluster is not None:
+            try:
+                new_ct_idx = clusters.index(ct_cluster)
+                labels[str(new_ct_idx)] = "Caller Tunes"
+            except ValueError:
+                pass
+        
         jobs[job_id] = {
             "clusters": clusters, "errors": errors,
-            "labels": {}, "total_urls": len(urls)
+            "labels": labels, "total_urls": len(urls)
         }
         save_job(job_id)
         
@@ -239,8 +285,12 @@ async def upload_excel_stream(file: UploadFile = File(...)):
 
 
 @app.post("/api/upload-excel", response_model=ClusterResponse)
-async def upload_excel(file: UploadFile = File(...)):
+async def upload_excel(
+    file: UploadFile = File(...),
+    enable_caller_tune: str = "false"
+):
     """Upload an Excel file. Parses all URL-like values from the RecordingURL column."""
+    is_caller_tune_enabled = enable_caller_tune.lower() == "true"
     try:
         contents = await file.read()
         df = pd.read_excel(io.BytesIO(contents))
@@ -267,13 +317,27 @@ async def upload_excel(file: UploadFile = File(...)):
     if not urls:
         raise HTTPException(status_code=400, detail="No valid URLs found in the Excel file.")
     
-    clusters, errors = await run_pipeline(urls)
+    clusters, errors, caller_tune_idx = await run_pipeline(urls, enable_yamnet=is_caller_tune_enabled)
+    
+    ct_cluster = None
+    if caller_tune_idx is not None:
+        ct_cluster = clusters[caller_tune_idx]
+        
     clusters.sort(key=len, reverse=True)
     
     job_id = str(uuid.uuid4())[:8]
+    
+    labels = {}
+    if ct_cluster is not None:
+        try:
+            new_ct_idx = clusters.index(ct_cluster)
+            labels[str(new_ct_idx)] = "Caller Tunes"
+        except ValueError:
+            pass
+            
     jobs[job_id] = {
         "clusters": clusters, "errors": errors,
-        "labels": {}, "total_urls": len(urls)
+        "labels": labels, "total_urls": len(urls)
     }
     save_job(job_id)
     
@@ -332,6 +396,59 @@ async def export_csv(job_id: str):
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=clusters_{job_id}.csv"}
     )
+
+import shutil
+
+@app.post("/api/export-callertunes/{job_id}")
+async def export_callertunes(job_id: str):
+    """Export the caller tunes cluster to a local folder in the backend."""
+    job = load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    
+    # Find the cluster with the label "Caller Tunes" (case insensitive)
+    labels = job.get("labels", {})
+    caller_tune_cluster_idx = None
+    for idx, label in labels.items():
+        if label.strip().lower() == "caller tunes":
+            caller_tune_cluster_idx = int(idx)
+            break
+    
+    if caller_tune_cluster_idx is None:
+        raise HTTPException(status_code=404, detail="No cluster labeled 'Caller Tunes' found.")
+        
+    if caller_tune_cluster_idx >= len(job["clusters"]):
+        raise HTTPException(status_code=500, detail="Invalid cluster index.")
+        
+    cluster_urls = job["clusters"][caller_tune_cluster_idx]
+    
+    export_dir = Path("./exported_callertunes")
+    export_dir.mkdir(exist_ok=True)
+    
+    copied_count = 0
+    errors = []
+    
+    for url in cluster_urls:
+        url_hash = hashlib.md5(url.encode()).hexdigest()
+        cached_path = CACHE_DIR / f"{url_hash}.wav"
+        
+        if cached_path.exists():
+            dest_filename = url.split("/")[-1]
+            dest_path = export_dir / dest_filename
+            try:
+                shutil.copy2(cached_path, dest_path)
+                copied_count += 1
+            except Exception as e:
+                errors.append(f"Failed to copy {dest_filename}: {e}")
+        else:
+            errors.append(f"File not in cache for {url}")
+            
+    return {
+        "status": "ok",
+        "message": f"Exported {copied_count} caller tunes to {export_dir.absolute()}",
+        "copied": copied_count,
+        "errors": errors
+    }
 
 
 # ----- Audio Proxy (for download support) -----

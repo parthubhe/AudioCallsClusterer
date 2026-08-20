@@ -8,11 +8,13 @@ interface ClusterGraphProps {
   onSelectAudio: (url: string) => void;
   onLabelChange: (clusterIdx: number, label: string) => void;
   playingUrl: string | null;
+  jobId?: string;
 }
 
-export default function ClusterGraph({ clusters, labels, onSelectAudio, onLabelChange, playingUrl }: ClusterGraphProps) {
+export default function ClusterGraph({ clusters, labels, onSelectAudio, onLabelChange, playingUrl, jobId }: ClusterGraphProps) {
   const [editingIdx, setEditingIdx] = useState<number | null>(null);
   const [editValue, setEditValue] = useState('');
+  const [exporting, setExporting] = useState(false);
 
   // Sort clusters so biggest are first
   const sortedClusters = [...clusters].sort((a, b) => b.length - a.length);
@@ -32,11 +34,33 @@ export default function ClusterGraph({ clusters, labels, onSelectAudio, onLabelC
     if (e.key === 'Escape') setEditingIdx(null);
   };
 
+  const handleBulkExport = async () => {
+    if (!jobId) return;
+    setExporting(true);
+    try {
+      const response = await fetch(`http://localhost:8000/api/export-callertunes/${jobId}`, {
+        method: 'POST'
+      });
+      if (response.ok) {
+        const data = await response.json();
+        alert(`Success! ${data.message}`);
+      } else {
+        const errData = await response.json().catch(() => ({}));
+        alert(`Export failed: ${errData.detail || response.statusText}`);
+      }
+    } catch (e) {
+      alert(`Export failed: ${e}`);
+    } finally {
+      setExporting(false);
+    }
+  };
+
   return (
     <div className="w-full h-full p-4 overflow-y-auto grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
       {sortedClusters.map((cluster, i) => {
         const label = labels[String(i)] || '';
         const isEditing = editingIdx === i;
+        const isCallerTunes = label.toLowerCase() === 'caller tunes';
 
         return (
           <motion.div
@@ -44,7 +68,13 @@ export default function ClusterGraph({ clusters, labels, onSelectAudio, onLabelC
             animate={{ opacity: 1, scale: 1 }}
             transition={{ duration: 0.3, delay: i * 0.03 }}
             key={i}
-            className="bg-white/[0.03] border border-white/10 rounded-2xl p-5 hover:bg-white/[0.06] transition-colors flex flex-col group"
+            className={`
+              rounded-2xl p-5 transition-all flex flex-col group
+              ${isCallerTunes 
+                ? 'bg-indigo-900/30 border-2 border-indigo-500/60 shadow-[0_0_20px_rgba(99,102,241,0.15)] hover:bg-indigo-900/40' 
+                : 'bg-white/[0.03] border border-white/10 hover:bg-white/[0.06]'
+              }
+            `}
           >
             {/* Header */}
             <div className="flex justify-between items-center mb-3">
@@ -87,6 +117,27 @@ export default function ClusterGraph({ clusters, labels, onSelectAudio, onLabelC
                 >
                   <Tag size={12} className="flex-shrink-0" />
                   <span className="truncate">{label || 'Add label...'}</span>
+                </button>
+              )}
+              
+              {isCallerTunes && (
+                <button
+                  onClick={handleBulkExport}
+                  disabled={exporting}
+                  className="mt-2 text-xs bg-indigo-600/20 text-indigo-400 hover:bg-indigo-600/30 px-3 py-1.5 rounded transition-colors w-full flex items-center justify-center gap-2"
+                  title="Exports all audio files to 'backend/exported_callertunes'"
+                >
+                  {exporting ? (
+                    <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                    </svg>
+                  ) : (
+                    <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                    </svg>
+                  )}
+                  {exporting ? 'Exporting...' : 'Bulk Export All'}
                 </button>
               )}
             </div>

@@ -23,6 +23,7 @@ export default function App() {
   const [progress, setProgress] = useState<ProgressState | null>(null);
   const [excelFile, setExcelFile] = useState<File | null>(null);
   const [inputMode, setInputMode] = useState<'paste' | 'excel'>('paste');
+  const [enableCallerTune, setEnableCallerTune] = useState(false);
   const [errors, setErrors] = useState<any[]>([]);
 
   const processWithSSE = useCallback(async (url: string, body: BodyInit, headers?: HeadersInit) => {
@@ -75,6 +76,7 @@ export default function App() {
                 // Final result
                 setClusters(data.clusters);
                 setJobId(data.job_id);
+                setLabels(data.labels || {});
                 setErrors(data.errors || []);
                 setProgress({ phase: 'done', current: data.clusters.length, total: data.clusters.length, message: `Done! ${data.clusters.length} clusters found.` });
               }
@@ -97,11 +99,12 @@ export default function App() {
     if (inputMode === 'excel' && excelFile) {
       const formData = new FormData();
       formData.append('file', excelFile);
+      formData.append('enable_caller_tune', enableCallerTune ? 'true' : 'false');
       await processWithSSE('http://localhost:8000/api/upload-excel-stream', formData);
     } else if (inputMode === 'paste' && urls.trim()) {
       await processWithSSE(
         'http://localhost:8000/api/cluster-stream',
-        JSON.stringify({ text: urls }),
+        JSON.stringify({ text: urls, enable_caller_tune: enableCallerTune }),
         { 'Content-Type': 'application/json' }
       );
     }
@@ -189,6 +192,23 @@ export default function App() {
             </button>
           </div>
 
+          {/* Caller Tune Toggle */}
+          <div className="flex items-center justify-between p-4 bg-white/5 rounded-xl border border-white/10">
+            <div>
+              <h3 className="text-sm font-medium text-gray-200">Caller Tune Clustering</h3>
+              <p className="text-xs text-gray-500 mt-0.5">Use AI to group all music/songs</p>
+            </div>
+            <label className="relative inline-flex items-center cursor-pointer">
+              <input 
+                type="checkbox" 
+                className="sr-only peer" 
+                checked={enableCallerTune}
+                onChange={(e) => setEnableCallerTune(e.target.checked)}
+              />
+              <div className="w-11 h-6 bg-gray-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-cyan-600"></div>
+            </label>
+          </div>
+
           {/* Input area */}
           {inputMode === 'paste' ? (
             <textarea
@@ -264,6 +284,7 @@ export default function App() {
                   onSelectAudio={setSelectedAudio}
                   onLabelChange={handleLabelChange}
                   playingUrl={selectedAudio}
+                  jobId={jobId}
                 />
               </div>
             </>

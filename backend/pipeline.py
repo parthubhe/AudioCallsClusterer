@@ -6,6 +6,13 @@ from pathlib import Path
 from collections import defaultdict
 from clustering import cluster_audio_files
 
+# Try to import yamnet_classifier for post-processing
+try:
+    from yamnet_classifier import is_caller_tune
+    YAMNET_AVAILABLE = True
+except ImportError:
+    YAMNET_AVAILABLE = False
+
 CACHE_DIR = Path("./audio_cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
@@ -83,7 +90,7 @@ def bucket_by_duration(durations: dict, tolerance=0.5):
         buckets[key].append(path)
     return buckets
 
-async def run_pipeline(urls: list[str], progress_callback=None):
+async def run_pipeline(urls: list[str], progress_callback=None, enable_yamnet=False):
     """
     Orchestrates the download, bucketing, and clustering.
     Returns: A tuple of (clusters, errors) where clusters is a list of URL lists.
@@ -131,12 +138,47 @@ async def run_pipeline(urls: list[str], progress_callback=None):
     
     # 5. Map back to URLs
     url_clusters = []
+    cluster_paths_list = [] # Keep paths for potential post-processing
     for cluster in clusters:
         url_cluster = [path_to_url[str(p)] for p in cluster if str(p) in path_to_url]
         if url_cluster:
             url_clusters.append(url_cluster)
+            cluster_paths_list.append(cluster)
+            
+    # 6. Post-processing: YAMNet Caller Tune Classification
+    caller_tune_cluster = []
+    final_clusters = []
+    
+    caller_tune_idx = None
+    if enable_yamnet and YAMNET_AVAILABLE:
+        if progress_callback:
+            await progress_callback("post_processing", 0, len(url_clusters), "Running YAMNet classification for caller tunes...")
+            
+        for i, (url_cluster, paths_cluster) in enumerate(zip(url_clusters, cluster_paths_list)):
+            if progress_callback and (i + 1) % 5 == 0:
+                await progress_callback("post_processing", i + 1, len(url_clusters), f"Running YAMNet classification... ({i+1}/{len(url_clusters)})")
+                
+            # Pick one representative file from the cluster
+            rep_path = paths_cluster[0]
+            
+            # Run the heavy TF/librosa work in a thread pool to avoid blocking the event loop
+            is_ct = await asyncio.to_thread(is_caller_tune, str(rep_path))
+            
+            if is_ct:
+                caller_tune_cluster.extend(url_cluster)
+            else:
+                final_clusters.append(url_cluster)
+                
+        if caller_tune_cluster:
+            # Add the large caller tune cluster at the end
+            final_clusters.append(caller_tune_cluster)
+            caller_tune_idx = len(final_clusters) - 1
+    else:
+        if enable_yamnet and not YAMNET_AVAILABLE:
+            print("Warning: YAMNet dependencies not found. Skipping post-processing.")
+        final_clusters = url_clusters
     
     if progress_callback:
-        await progress_callback("done", len(url_clusters), len(url_clusters), f"Done! {len(url_clusters)} clusters found.")
+        await progress_callback("done", len(final_clusters), len(final_clusters), f"Done! {len(final_clusters)} clusters found.")
         
-    return url_clusters, download_errors
+    return final_clusters, download_errors, caller_tune_idx
