@@ -4,13 +4,14 @@ import numpy as np
 import librosa
 from collections import defaultdict
 import scipy.spatial.distance as distance
-
+import asyncio
 def pcm_hash(path: str) -> str:
-    """Compute SHA1 hash of the raw PCM data (ignoring headers)."""
+    """Compute SHA1 hash of the raw PCM data directly (ignoring 44-byte WAV header)."""
     try:
-        with wave.open(str(path), 'rb') as wf:
-            pcm = wf.readframes(wf.getnframes())
-        return hashlib.sha1(pcm).hexdigest()
+        from pathlib import Path
+        data = Path(path).read_bytes()
+        # Skip the 44-byte header to hash only the audio data
+        return hashlib.sha1(data[44:]).hexdigest()
     except Exception as e:
         print(f"Error hashing {path}: {e}")
         return str(path)  # Fallback to unique path
@@ -46,7 +47,7 @@ class UnionFind:
         if ra != rb:
             self.parent[ra] = rb
 
-def cluster_audio_files(duration_buckets: dict, distance_threshold=25.0):
+def cluster_audio_files(duration_buckets: dict, distance_threshold=25.0, progress_callback=None):
     """
     Apply Two-tier clustering within each bucket.
     Tier 1: PCM Hash
@@ -54,15 +55,23 @@ def cluster_audio_files(duration_buckets: dict, distance_threshold=25.0):
     Returns a list of clusters, where each cluster is a list of file paths (or URLs).
     """
     final_clusters = []
+    
+    total_buckets = len(duration_buckets)
+    completed_buckets = 0
+    step = max(1, total_buckets // 100)
 
     for dur_key, file_paths in duration_buckets.items():
+        completed_buckets += 1
+        if progress_callback and completed_buckets % step == 0:
+            progress_callback("clustering", completed_buckets, total_buckets, f"Clustering buckets... ({completed_buckets}/{total_buckets})")
+            
         if len(file_paths) == 1:
             final_clusters.append(file_paths)
             continue
         
         # Tier 1: Exact Hash matching
         hash_groups = defaultdict(list)
-        for path in file_paths:
+        for i_path, path in enumerate(file_paths):
             h = pcm_hash(path)
             hash_groups[h].append(path)
             
@@ -78,7 +87,7 @@ def cluster_audio_files(duration_buckets: dict, distance_threshold=25.0):
         # Tier 2: MFCC similarity among representatives
         features = {}
         valid_reps = []
-        for rep in representatives:
+        for i_rep, rep in enumerate(representatives):
             feat = extract_features(rep_to_paths[rep][0])
             if feat is not None:
                 features[rep] = feat

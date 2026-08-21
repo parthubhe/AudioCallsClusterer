@@ -9,14 +9,18 @@ from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 import pandas as pd
 
-from pipeline import run_pipeline, CACHE_DIR
+from pipeline import run_pipeline, run_pipeline_from_cache, list_cache_files, CACHE_DIR, download_all
 from sse_starlette.sse import EventSourceResponse
 
 app = FastAPI(title="Audio Clusterer")
 
+SAVED_BATCHES_DIR = Path("saved_batches")
+EXTRACTED_CLUSTERS_DIR = Path("extracted_clusters")
+SAVED_BATCHES_DIR.mkdir(exist_ok=True)
+EXTRACTED_CLUSTERS_DIR.mkdir(exist_ok=True)
 # Allow CORS for React frontend
 app.add_middleware(
     CORSMiddleware,
@@ -55,6 +59,25 @@ class ClusterRequest(BaseModel):
     text: str
     enable_caller_tune: bool = False
 
+class AudioClustersResponse(BaseModel):
+    clusters: List[List[str]]
+    errors: List[str]
+
+class SavedBatch(BaseModel):
+    name: str
+    clusters: List[List[str]]
+    labels: Dict[str, str]
+    total_files: Optional[int] = None
+
+class ExtractClusterRequest(BaseModel):
+    batch_name: str
+    selected_clusters: List[Dict[str, Any]]
+
+class ImportBatchRequest(BaseModel):
+    name: str
+    clusters: List[List[str]]
+    labels: Dict[str, str] = {}
+
 class ClusterResponse(BaseModel):
     job_id: str
     clusters: List[List[str]]
@@ -68,6 +91,12 @@ def parse_urls(text: str) -> list[str]:
     """Extract and dedupe .wav URLs from pasted text."""
     urls = re.findall(r'https?://[^\s,;"\']+\.wav', text)
     return list(set(urls))
+
+# ----- Health -----
+
+@app.get("/api/health")
+async def health():
+    return {"status": "ok"}
 
 # ----- Endpoints -----
 
@@ -192,23 +221,29 @@ async def cluster_audio_stream(request: ClusterRequest):
     return EventSourceResponse(event_generator())
 
 
+def _parse_file(contents: bytes, filename: str) -> pd.DataFrame:
+    if filename.lower().endswith('.csv'):
+        return pd.read_csv(io.BytesIO(contents))
+    return pd.read_excel(io.BytesIO(contents))
+
 @app.post("/api/upload-excel-stream")
 async def upload_excel_stream(
     file: UploadFile = File(...),
     enable_caller_tune: str = "false"
 ):
-    """Upload an Excel file and stream progress via SSE."""
+    """Upload an Excel/CSV file and stream progress via SSE."""
     is_caller_tune_enabled = enable_caller_tune.lower() == "true"
     try:
         contents = await file.read()
-        df = pd.read_excel(io.BytesIO(contents))
+        df = await asyncio.to_thread(_parse_file, contents, file.filename)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to read Excel file: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to read file: {e}")
     
     # Try to find the column with URLs
     url_column = None
     for col in df.columns:
-        if 'url' in col.lower() or 'recording' in col.lower() or 'link' in col.lower():
+        col_str = str(col).lower()
+        if 'url' in col_str or 'recording' in col_str or 'link' in col_str:
             url_column = col
             break
     
@@ -249,8 +284,17 @@ async def upload_excel_stream(
             event = await queue.get()
             yield event
         
-        clusters, errors, caller_tune_idx = task.result()
-        
+        try:
+            clusters, errors, caller_tune_idx = task.result()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            yield {
+                "event": "error",
+                "data": json.dumps({"detail": f"Backend Error: {str(e)}"})
+            }
+            return
+            
         ct_cluster = None
         if caller_tune_idx is not None:
             ct_cluster = clusters[caller_tune_idx]
@@ -289,18 +333,19 @@ async def upload_excel(
     file: UploadFile = File(...),
     enable_caller_tune: str = "false"
 ):
-    """Upload an Excel file. Parses all URL-like values from the RecordingURL column."""
+    """Upload an Excel/CSV file. Parses all URL-like values from the RecordingURL column."""
     is_caller_tune_enabled = enable_caller_tune.lower() == "true"
     try:
         contents = await file.read()
-        df = pd.read_excel(io.BytesIO(contents))
+        df = await asyncio.to_thread(_parse_file, contents, file.filename)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to read Excel file: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to read file: {e}")
     
     # Try to find the column with URLs
     url_column = None
     for col in df.columns:
-        if 'url' in col.lower() or 'recording' in col.lower() or 'link' in col.lower():
+        col_str = str(col).lower()
+        if 'url' in col_str or 'recording' in col_str or 'link' in col_str:
             url_column = col
             break
     
@@ -342,6 +387,258 @@ async def upload_excel(
     save_job(job_id)
     
     return {"job_id": job_id, "clusters": clusters, "errors": errors, "total_urls": len(urls)}
+
+
+# ----- Cache / Batch -----
+
+@app.get("/api/cache-files")
+async def get_cache_files():
+    try:
+        files = await asyncio.to_thread(list_cache_files)
+        return {"total_cached_files": len(files)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/saved-batches")
+async def save_batch(batch: SavedBatch):
+    import datetime
+    import re
+    safe_name = re.sub(r'[\\/*?:"<>|]', "_", batch.name)
+    file_path = SAVED_BATCHES_DIR / f"{safe_name}.json"
+    data = {
+        "batch_name": safe_name,
+        "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "total_files": batch.total_files or sum(len(c) for c in batch.clusters),
+        "clusters": batch.clusters,
+        "labels": batch.labels
+    }
+    await asyncio.to_thread(lambda: file_path.write_text(json.dumps(data)))
+    return {"message": "Batch saved successfully"}
+
+@app.get("/api/saved-batches")
+async def list_saved_batches():
+    def get_files():
+        files = list(SAVED_BATCHES_DIR.glob("*.json"))
+        return sorted([f.stem for f in files])
+    
+    batches = await asyncio.to_thread(get_files)
+    return {"batches": batches}
+
+@app.get("/api/saved-batches/{name}")
+async def get_saved_batch(name: str):
+    file_path = SAVED_BATCHES_DIR / f"{name}.json"
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Batch not found")
+    content = await asyncio.to_thread(file_path.read_text)
+    return json.loads(content)
+
+@app.post("/api/extract-clusters")
+async def extract_clusters(req: ExtractClusterRequest):
+    import shutil
+    import urllib.parse
+    
+    def do_extraction():
+        extracted_count = 0
+        for cluster in req.selected_clusters:
+            label = cluster.get("label", "unlabeled").replace("/", "_").replace("\\", "_")
+            if not label.strip():
+                label = "unlabeled"
+            urls = cluster.get("urls", [])
+            
+            cluster_dir = EXTRACTED_CLUSTERS_DIR / req.batch_name / label
+            cluster_dir.mkdir(parents=True, exist_ok=True)
+            
+            for url in urls:
+                url_hash = hashlib.md5(url.encode()).hexdigest()
+                cached_file = CACHE_DIR / f"{url_hash}.wav"
+                
+                if cached_file.exists():
+                    # Extract UUID from URL
+                    parsed = urllib.parse.urlparse(url)
+                    filename = Path(parsed.path).name
+                    if not filename:
+                        filename = f"{url_hash}.wav"
+                    
+                    dest_file = cluster_dir / filename
+                    shutil.copy2(cached_file, dest_file)
+                    extracted_count += 1
+        return extracted_count
+        
+    count = await asyncio.to_thread(do_extraction)
+    return {"message": f"Successfully extracted {count} files"}
+
+class BatchRequest(BaseModel):
+    batch_size: int = 5000
+    offset: int = 0
+    enable_caller_tune: bool = False
+
+
+@app.post("/api/cluster-batch-stream")
+async def cluster_batch_stream(request: BatchRequest):
+    """Process a batch of cached files and stream progress via SSE."""
+    import asyncio
+    
+    # Get all cache files in a background thread
+    all_files = await asyncio.to_thread(list_cache_files)
+    total_files = len(all_files)
+    
+    if total_files == 0:
+        raise HTTPException(status_code=400, detail="No cached files found. Upload and process an Excel file first.")
+    
+    # Slice for this batch
+    batch = all_files[request.offset : request.offset + request.batch_size]
+    
+    if not batch:
+        raise HTTPException(status_code=400, detail=f"No files in range offset={request.offset}, batch_size={request.batch_size}. Total cached: {total_files}")
+    
+    file_paths = [f["path"] for f in batch]
+    
+    queue = asyncio.Queue()
+    
+    async def progress_callback(phase, current, total, message):
+        await queue.put({
+            "event": "progress",
+            "data": json.dumps({
+                "phase": phase, "current": current, "total": total, "message": message
+            })
+        })
+    
+    async def event_generator():
+        task = asyncio.create_task(
+            run_pipeline_from_cache(file_paths, progress_callback=progress_callback, enable_yamnet=request.enable_caller_tune)
+        )
+        
+        while not task.done():
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=0.5)
+                yield event
+            except asyncio.TimeoutError:
+                yield {"event": "heartbeat", "data": "ping"}
+        
+        # Drain remaining events
+        while not queue.empty():
+            event = await queue.get()
+            yield event
+        
+        clusters, errors, caller_tune_idx = task.result()
+        
+        # The clusters here contain file paths, not URLs.
+        # We'll return paths so the frontend can reference them.
+        ct_cluster = None
+        if caller_tune_idx is not None:
+            ct_cluster = clusters[caller_tune_idx]
+            
+        clusters.sort(key=len, reverse=True)
+        
+        job_id = str(uuid.uuid4())[:8]
+        
+        labels = {}
+        if ct_cluster is not None:
+            try:
+                new_ct_idx = clusters.index(ct_cluster)
+                labels[str(new_ct_idx)] = "Caller Tunes"
+            except ValueError:
+                pass
+        
+        jobs[job_id] = {
+            "clusters": clusters, "errors": errors,
+            "labels": labels, "total_urls": len(file_paths)
+        }
+        save_job(job_id)
+        
+        yield {
+            "event": "result",
+            "data": json.dumps({
+                "job_id": job_id,
+                "clusters": clusters,
+                "errors": errors,
+                "labels": labels,
+                "total_files": total_files,
+                "batch_offset": request.offset,
+                "batch_size": len(batch),
+                "total_urls": len(file_paths)
+            })
+        }
+    
+    return EventSourceResponse(event_generator())
+
+
+@app.post("/api/import-batch-stream")
+async def import_batch_stream(request: ImportBatchRequest):
+    """Import a pre-clustered JSON file and download missing audio files to cache."""
+    import asyncio
+    import datetime
+
+    # 1. Extract all unique URLs from the clusters
+    unique_urls = set()
+    for cluster in request.clusters:
+        for url in cluster:
+            unique_urls.add(url)
+    
+    urls_list = list(unique_urls)
+    queue = asyncio.Queue()
+
+    async def progress_callback(phase, current, total, message):
+        await queue.put({
+            "event": "progress",
+            "data": json.dumps({
+                "phase": phase, "current": current, "total": total, "message": message
+            })
+        })
+
+    async def event_generator():
+        # Yield an initial progress message
+        await queue.put({
+            "event": "progress",
+            "data": json.dumps({
+                "phase": "starting", "current": 0, "total": len(urls_list),
+                "message": f"Scanning cache for {len(urls_list)} files..."
+            })
+        })
+
+        # Start download task
+        task = asyncio.create_task(
+            download_all(urls_list, concurrency=20, progress_callback=progress_callback)
+        )
+
+        while not task.done():
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=0.5)
+                yield event
+            except asyncio.TimeoutError:
+                yield {"event": "heartbeat", "data": "ping"}
+        
+        # Drain remaining events
+        while not queue.empty():
+            event = await queue.get()
+            yield event
+
+        results, errors = task.result()
+
+        # 2. Save the batch to saved_batches/
+        import re
+        safe_name = re.sub(r'[\\/*?:"<>|]', "_", request.name)
+        file_path = SAVED_BATCHES_DIR / f"{safe_name}.json"
+        data = {
+            "batch_name": safe_name,
+            "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+            "total_files": sum(len(c) for c in request.clusters),
+            "clusters": request.clusters,
+            "labels": request.labels
+        }
+        
+        await asyncio.to_thread(lambda: file_path.write_text(json.dumps(data)))
+
+        yield {
+            "event": "result",
+            "data": json.dumps({
+                "message": f"Successfully imported {safe_name} and synced cache.",
+                "batch_name": safe_name,
+                "errors": errors
+            })
+        }
+
+    return EventSourceResponse(event_generator())
 
 
 # ----- Labels -----

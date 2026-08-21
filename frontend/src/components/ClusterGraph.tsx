@@ -8,13 +8,16 @@ interface ClusterGraphProps {
   onSelectAudio: (url: string) => void;
   onLabelChange: (clusterIdx: number, label: string) => void;
   playingUrl: string | null;
-  jobId?: string;
+  jobId?: string | null;
+  batchName?: string | null;
 }
 
-export default function ClusterGraph({ clusters, labels, onSelectAudio, onLabelChange, playingUrl, jobId }: ClusterGraphProps) {
+export default function ClusterGraph({ clusters, labels, onSelectAudio, onLabelChange, playingUrl, jobId, batchName }: ClusterGraphProps) {
   const [editingIdx, setEditingIdx] = useState<number | null>(null);
   const [editValue, setEditValue] = useState('');
   const [exporting, setExporting] = useState(false);
+  const [selectedClusters, setSelectedClusters] = useState<Set<number>>(new Set());
+  const [extracting, setExtracting] = useState(false);
 
   // Sort clusters so biggest are first
   const sortedClusters = [...clusters].sort((a, b) => b.length - a.length);
@@ -55,9 +58,76 @@ export default function ClusterGraph({ clusters, labels, onSelectAudio, onLabelC
     }
   };
 
+  const handleExtract = async () => {
+    if (!batchName) {
+      alert("No batch name provided. Please save the batch first before extracting!");
+      return;
+    }
+    if (selectedClusters.size === 0) return;
+
+    setExtracting(true);
+    const selectedData = Array.from(selectedClusters).map(idx => {
+      const cluster = sortedClusters[idx];
+      return {
+        label: labels[String(idx)] || `Cluster ${idx + 1}`,
+        urls: cluster
+      };
+    });
+
+    try {
+      const response = await fetch(`http://localhost:8000/api/extract-clusters`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ batch_name: batchName, selected_clusters: selectedData })
+      });
+      if (response.ok) {
+        const data = await response.json();
+        alert(`Success! ${data.message}`);
+        setSelectedClusters(new Set());
+      } else {
+        const errData = await response.json().catch(() => ({}));
+        alert(`Extraction failed: ${errData.detail || response.statusText}`);
+      }
+    } catch (e) {
+      alert(`Extraction failed: ${e}`);
+    } finally {
+      setExtracting(false);
+    }
+  };
+
+  const toggleSelect = (idx: number) => {
+    const next = new Set(selectedClusters);
+    if (next.has(idx)) next.delete(idx);
+    else next.add(idx);
+    setSelectedClusters(next);
+  };
+
   return (
-    <div className="w-full h-full p-4 overflow-y-auto grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
-      {sortedClusters.map((cluster, i) => {
+    <div className="w-full h-full flex flex-col">
+      {/* Top action bar */}
+      <div className="flex justify-between items-center px-4 py-3 border-b border-white/5 bg-black/10">
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-gray-400">{selectedClusters.size} selected</span>
+          {selectedClusters.size > 0 && (
+            <button
+              onClick={() => setSelectedClusters(new Set())}
+              className="text-[10px] uppercase tracking-wider text-gray-500 hover:text-gray-300 font-bold"
+            >
+              Clear
+            </button>
+          )}
+        </div>
+        <button
+          onClick={handleExtract}
+          disabled={extracting || selectedClusters.size === 0}
+          className="bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 text-xs font-bold py-1.5 px-4 rounded-lg transition-all disabled:opacity-30 flex items-center gap-2 border border-emerald-500/30"
+        >
+          {extracting ? 'Extracting...' : 'Extract Selected Clusters'}
+        </button>
+      </div>
+      
+      <div className="flex-1 p-4 overflow-y-auto grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
+        {sortedClusters.map((cluster, i) => {
         const label = labels[String(i)] || '';
         const isEditing = editingIdx === i;
         const isCallerTunes = label.toLowerCase() === 'caller tunes';
@@ -78,7 +148,15 @@ export default function ClusterGraph({ clusters, labels, onSelectAudio, onLabelC
           >
             {/* Header */}
             <div className="flex justify-between items-center mb-3">
-              <h3 className="text-sm font-semibold text-gray-300">Cluster {i + 1}</h3>
+              <div className="flex items-center gap-2">
+                <input 
+                  type="checkbox"
+                  checked={selectedClusters.has(i)}
+                  onChange={() => toggleSelect(i)}
+                  className="w-4 h-4 rounded border-gray-600 text-cyan-500 focus:ring-cyan-500 focus:ring-offset-gray-900 bg-gray-700 cursor-pointer"
+                />
+                <h3 className="text-sm font-semibold text-gray-300">Cluster {i + 1}</h3>
+              </div>
               <span className="text-xs bg-cyan-500/20 text-cyan-300 px-2 py-1 rounded-md font-medium">
                 {cluster.length} clip{cluster.length > 1 ? 's' : ''}
               </span>
@@ -178,6 +256,7 @@ export default function ClusterGraph({ clusters, labels, onSelectAudio, onLabelC
           </motion.div>
         );
       })}
+      </div>
     </div>
   );
 }

@@ -33,7 +33,7 @@ export default function ExcelUpload({ onFileSelected, disabled }: ExcelUploadPro
     const files = e.dataTransfer.files;
     if (files.length > 0) {
       const file = files[0];
-      if (file.name.endsWith('.xlsx') || file.name.endsWith('.xls')) {
+      if (file.name.endsWith('.xlsx') || file.name.endsWith('.xls') || file.name.endsWith('.csv')) {
         setSelectedFile(file);
         onFileSelected(file);
       }
@@ -113,7 +113,7 @@ export default function ExcelUpload({ onFileSelected, disabled }: ExcelUploadPro
                 <span className="text-cyan-300 font-semibold">Drop to upload</span>
               ) : (
                 <>
-                  Drop <span className="text-gray-300 font-medium">.xlsx</span> here or{' '}
+                  Drop <span className="text-gray-300 font-medium">.xlsx, .xls, or .csv</span> here or{' '}
                   <span className="text-cyan-400 font-medium underline underline-offset-2">browse</span>
                 </>
               )}
@@ -125,7 +125,7 @@ export default function ExcelUpload({ onFileSelected, disabled }: ExcelUploadPro
       <input
         ref={inputRef}
         type="file"
-        accept=".xlsx,.xls"
+        accept=".xlsx,.xls,.csv"
         onChange={handleFileChange}
         className="hidden"
       />

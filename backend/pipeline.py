@@ -16,65 +16,87 @@ except ImportError:
 CACHE_DIR = Path("./audio_cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
-async def download_one(session, url, sem):
-    """Downloads one URL into the cache based on its UUID or Hash."""
-    # Assuming UUID is in the URL, e.g. ebf845fe-5acf-4d91-9413-bcaacc540f27.wav
-    # If not, hash the URL to generate a unique filename
-    try:
-        url_hash = hashlib.md5(url.encode()).hexdigest()
-        fname = f"{url_hash}.wav"
-        dest = CACHE_DIR / fname
-        if dest.exists():
+async def download_one(session, url, dest, sem, max_retries=3):
+    """Downloads one URL into the cache with retry logic."""
+    for attempt in range(max_retries):
+        try:
+            async with sem:
+                # Add a timeout to prevent hanging connections
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    resp.raise_for_status()
+                    data = await resp.read()
+                    dest.write_bytes(data)
             return dest, url
-            
-        async with sem:
-            async with session.get(url) as resp:
-                resp.raise_for_status()
-                data = await resp.read()
-                dest.write_bytes(data)
-        return dest, url
-    except Exception as e:
-        print(f"Failed to download {url}: {e}")
-        return None, url
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"Failed to download {url} after {max_retries} attempts: {e}")
+                if dest.exists():
+                    try:
+                        dest.unlink()
+                    except:
+                        pass
+                return None, url
+            await asyncio.sleep(1 + attempt)  # Simple backoff
 
 async def download_all(urls, concurrency=15, progress_callback=None):
-    """Concurrent download of all URLs with progress reporting."""
+    """Concurrent download of URLs, skipping cached ones, with progress reporting."""
     sem = asyncio.Semaphore(concurrency)
-    total = len(urls)
+    
+    def scan_cache(url_list):
+        cached = []
+        to_dl = []
+        for url in url_list:
+            url_hash = hashlib.md5(url.encode()).hexdigest()
+            dest = CACHE_DIR / f"{url_hash}.wav"
+            # Check if exists and is not an empty file
+            if dest.exists() and dest.stat().st_size > 0:
+                cached.append((dest, url))
+            else:
+                to_dl.append((url, dest))
+        return cached, to_dl
+
+    # 1. Synchronously scan cache in a background thread to prevent blocking Uvicorn
+    cached_results, to_download = await asyncio.to_thread(scan_cache, urls)
+            
+    if progress_callback and cached_results:
+        await progress_callback("downloading", len(cached_results), len(urls), f"Found {len(cached_results)} cached files, skipping download...")
+    
+    total = len(to_download)
     completed = 0
     errors = []
+    
+    if total == 0:
+        return cached_results, errors
 
-    async def download_with_progress(session, url):
+    async def download_with_progress(session, url, dest):
         nonlocal completed
-        result = await download_one(session, url, sem)
+        result = await download_one(session, url, dest, sem)
         completed += 1
         if progress_callback:
-            await progress_callback("downloading", completed, total, f"Downloading files... ({completed}/{total})")
+            # We add len(cached_results) to show absolute progress across all URLs
+            current_abs = completed + len(cached_results)
+            await progress_callback("downloading", current_abs, len(urls), f"Downloading files... ({current_abs}/{len(urls)})")
         if result[0] is None:
             errors.append({"url": url, "error": "Download failed"})
         return result
 
     async with aiohttp.ClientSession() as session:
-        tasks = [download_with_progress(session, u) for u in urls]
+        tasks = [download_with_progress(session, u, d) for u, d in to_download]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
-    valid_results = []
-    for r in results:
-        if isinstance(r, Exception):
-            continue
-        p, u = r
-        if p is not None:
-            valid_results.append((p, u))
-    
-    return valid_results, errors
+    downloaded = [r for r in results if isinstance(r, tuple) and r[0] is not None]
+    return cached_results + downloaded, errors
+
 
 def get_duration_seconds(path) -> float:
-    """Reads duration from WAV header."""
+    """Reads duration from WAV header based on file size (assuming 8kHz 16-bit mono)."""
     try:
-        with wave.open(str(path), 'rb') as wf:
-            frames = wf.getnframes()
-            rate = wf.getframerate()
-            return frames / float(rate)
+        if isinstance(path, str):
+            from pathlib import Path
+            path = Path(path)
+        size = path.stat().st_size
+        # (size - header) / (sample_rate * channels * sample_width)
+        return max(0.0, (size - 44) / 16000.0)
     except Exception as e:
         print(f"Error reading duration for {path}: {e}")
         return -1.0
@@ -113,11 +135,27 @@ async def run_pipeline(urls: list[str], progress_callback=None, enable_yamnet=Fa
     
     # 2. Extract Duration
     path_to_url = {str(p): u for p, u in downloaded}
-    durations = {}
-    for i, (p, u) in enumerate(downloaded):
-        durations[str(p)] = get_duration_seconds(p)
-        if progress_callback and (i + 1) % 10 == 0:
-            await progress_callback("extracting", i + 1, len(downloaded), f"Extracting durations... ({i+1}/{len(downloaded)})")
+    
+    loop = asyncio.get_running_loop()
+    
+    def sync_progress(phase, current, total, message):
+        if progress_callback:
+            asyncio.run_coroutine_threadsafe(
+                progress_callback(phase, current, total, message), 
+                loop
+            )
+
+    def do_extraction(downloaded_files):
+        durs = {}
+        total = len(downloaded_files)
+        step = max(1, total // 100)  # Update exactly every 1%
+        for i, (p, u) in enumerate(downloaded_files):
+            durs[str(p)] = get_duration_seconds(p)
+            if (i + 1) % step == 0:
+                sync_progress("extracting", i + 1, total, f"Extracting durations... ({i+1}/{total})")
+        return durs
+
+    durations = await asyncio.to_thread(do_extraction, downloaded)
     
     if progress_callback:
         await progress_callback("extracting", len(downloaded), len(downloaded), "Duration extraction complete.")
@@ -132,7 +170,11 @@ async def run_pipeline(urls: list[str], progress_callback=None, enable_yamnet=Fa
     # 4. Cluster
     if progress_callback:
         await progress_callback("clustering", 0, len(buckets), f"Clustering within {len(buckets)} buckets...")
-    clusters = cluster_audio_files(buckets, distance_threshold=25.0)
+        
+    def do_clustering(buckets_dict):
+        return cluster_audio_files(buckets_dict, distance_threshold=25.0, progress_callback=sync_progress)
+        
+    clusters = await asyncio.to_thread(do_clustering, buckets)
     if progress_callback:
         await progress_callback("clustering", len(buckets), len(buckets), f"Clustering complete. Found {len(clusters)} clusters.")
     
@@ -182,3 +224,110 @@ async def run_pipeline(urls: list[str], progress_callback=None, enable_yamnet=Fa
         await progress_callback("done", len(final_clusters), len(final_clusters), f"Done! {len(final_clusters)} clusters found.")
         
     return final_clusters, download_errors, caller_tune_idx
+
+
+def list_cache_files() -> list[dict]:
+    """List all valid .wav files in the audio cache directory."""
+    files = []
+    for f in CACHE_DIR.glob("*.wav"):
+        try:
+            size = f.stat().st_size
+            if size > 0:
+                files.append({
+                    "path": str(f),
+                    "filename": f.name,
+                    "size_bytes": size
+                })
+        except Exception:
+            continue
+    return files
+
+
+async def run_pipeline_from_cache(file_paths: list[str], progress_callback=None, enable_yamnet=False):
+    """
+    Run clustering pipeline on files already in cache (skips download).
+    file_paths: list of absolute paths to .wav files in audio_cache.
+    Returns: (clusters_as_paths, errors, caller_tune_idx)
+    """
+    total = len(file_paths)
+    print(f"Batch processing {total} cached files...")
+    
+    if progress_callback:
+        await progress_callback("starting", 0, total, f"Starting batch pipeline with {total} files...")
+    
+    loop = asyncio.get_running_loop()
+    
+    def sync_progress(phase, current, total, message):
+        if progress_callback:
+            asyncio.run_coroutine_threadsafe(
+                progress_callback(phase, current, total, message), 
+                loop
+            )
+
+    # 1. Extract Duration (in background thread)
+    if progress_callback:
+        await progress_callback("extracting", 0, total, f"Extracting durations from {total} files...")
+
+    def do_extraction(paths):
+        durs = {}
+        step = max(1, len(paths) // 100)
+        for i, p in enumerate(paths):
+            durs[p] = get_duration_seconds(p)
+            if (i + 1) % step == 0:
+                sync_progress("extracting", i + 1, len(paths), f"Extracting durations... ({i+1}/{len(paths)})")
+        return durs
+
+    durations = await asyncio.to_thread(do_extraction, file_paths)
+    
+    if progress_callback:
+        await progress_callback("extracting", total, total, "Duration extraction complete.")
+    
+    # 2. Bucket
+    if progress_callback:
+        await progress_callback("bucketing", 0, 1, "Bucketing by duration...")
+    buckets = bucket_by_duration(durations, tolerance=0.5)
+    if progress_callback:
+        await progress_callback("bucketing", 1, 1, f"Created {len(buckets)} duration buckets.")
+    
+    # 3. Cluster (in background thread)
+    if progress_callback:
+        await progress_callback("clustering", 0, len(buckets), f"Clustering within {len(buckets)} buckets...")
+        
+    def do_clustering(buckets_dict):
+        return cluster_audio_files(buckets_dict, distance_threshold=25.0, progress_callback=sync_progress)
+        
+    clusters = await asyncio.to_thread(do_clustering, buckets)
+    if progress_callback:
+        await progress_callback("clustering", len(buckets), len(buckets), f"Clustering complete. Found {len(clusters)} clusters.")
+    
+    # 4. Post-processing: YAMNet (optional)
+    caller_tune_idx = None
+    if enable_yamnet and YAMNET_AVAILABLE:
+        caller_tune_cluster = []
+        final_clusters = []
+        
+        if progress_callback:
+            await progress_callback("post_processing", 0, len(clusters), "Running YAMNet classification...")
+            
+        for i, paths_cluster in enumerate(clusters):
+            if progress_callback and (i + 1) % 5 == 0:
+                await progress_callback("post_processing", i + 1, len(clusters), f"YAMNet classification... ({i+1}/{len(clusters)})")
+            
+            rep_path = paths_cluster[0]
+            is_ct = await asyncio.to_thread(is_caller_tune, str(rep_path))
+            
+            if is_ct:
+                caller_tune_cluster.extend(paths_cluster)
+            else:
+                final_clusters.append(paths_cluster)
+                
+        if caller_tune_cluster:
+            final_clusters.append(caller_tune_cluster)
+            caller_tune_idx = len(final_clusters) - 1
+    else:
+        final_clusters = clusters
+    
+    if progress_callback:
+        await progress_callback("done", len(final_clusters), len(final_clusters), f"Done! {len(final_clusters)} clusters found.")
+        
+    return final_clusters, [], caller_tune_idx

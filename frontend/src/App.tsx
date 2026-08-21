@@ -1,5 +1,5 @@
-import { useState, useCallback } from 'react';
-import { FileAudio, UploadCloud, RefreshCw, Download, FileSpreadsheet } from 'lucide-react';
+import { useState, useCallback, useRef } from 'react';
+import { FileAudio, UploadCloud, RefreshCw, Download, FileSpreadsheet, Database, ChevronRight, ChevronLeft, Bookmark, Save, Upload } from 'lucide-react';
 import { motion } from 'framer-motion';
 import ClusterGraph from './components/ClusterGraph';
 import AudioPlayer from './components/AudioPlayer';
@@ -13,6 +13,14 @@ interface ProgressState {
   message: string;
 }
 
+interface BatchInfo {
+  totalFiles: number;
+  currentOffset: number;
+  batchSize: number;
+  currentBatchNum: number;
+  totalBatches: number;
+}
+
 export default function App() {
   const [urls, setUrls] = useState<string>('');
   const [loading, setLoading] = useState(false);
@@ -22,9 +30,22 @@ export default function App() {
   const [labels, setLabels] = useState<Record<string, string>>({});
   const [progress, setProgress] = useState<ProgressState | null>(null);
   const [excelFile, setExcelFile] = useState<File | null>(null);
-  const [inputMode, setInputMode] = useState<'paste' | 'excel'>('paste');
+  const [inputMode, setInputMode] = useState<'paste' | 'excel' | 'batch' | 'saved'>('paste');
   const [enableCallerTune, setEnableCallerTune] = useState(false);
   const [errors, setErrors] = useState<any[]>([]);
+
+  // Batch processing state
+  const [batchSize, setBatchSize] = useState(5000);
+  const [batchInfo, setBatchInfo] = useState<BatchInfo | null>(null);
+  const [cacheTotal, setCacheTotal] = useState<number | null>(null);
+  const [loadingCache, setLoadingCache] = useState(false);
+  const [allBatchClusters, setAllBatchClusters] = useState<string[][]>([]);
+  const allBatchLabelsRef = useRef<Record<string, string>>({});
+  
+  // Saved pages state
+  const [savedBatches, setSavedBatches] = useState<string[]>([]);
+  const [viewingBatchName, setViewingBatchName] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const processWithSSE = useCallback(async (url: string, body: BodyInit, headers?: HeadersInit) => {
     setLoading(true);
@@ -69,11 +90,9 @@ export default function App() {
             try {
               const data = JSON.parse(dataStr);
 
-              // Check if this is a progress event or the final result
               if (data.phase) {
                 setProgress(data);
               } else if (data.clusters) {
-                // Final result
                 setClusters(data.clusters);
                 setJobId(data.job_id);
                 setLabels(data.labels || {});
@@ -95,6 +114,116 @@ export default function App() {
     }
   }, []);
 
+  // Batch SSE handler — accumulates clusters across batches
+  const processBatchSSE = useCallback(async (offset: number, size: number, isFirstBatch: boolean) => {
+    setLoading(true);
+    setSelectedAudio(null);
+    setProgress({ phase: 'starting', current: 0, total: 1, message: 'Starting batch...' });
+
+    if (isFirstBatch) {
+      setAllBatchClusters([]);
+      allBatchLabelsRef.current = {};
+      setClusters(null);
+      setJobId(null);
+      setLabels({});
+      setErrors([]);
+    }
+
+    try {
+      const response = await fetch('http://localhost:8000/api/cluster-batch-stream', {
+        method: 'POST',
+        body: JSON.stringify({ batch_size: size, offset, enable_caller_tune: enableCallerTune }),
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({ detail: 'Unknown error' }));
+        throw new Error(err.detail || 'Failed to process batch');
+      }
+
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      if (!reader) throw new Error('No response body');
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('data:')) {
+            const dataStr = line.slice(5).trim();
+            if (dataStr === 'ping') continue;
+
+            try {
+              const data = JSON.parse(dataStr);
+
+              if (data.phase) {
+                setProgress(data);
+              } else if (data.clusters) {
+                // Accumulate clusters from this batch
+                setAllBatchClusters(prev => {
+                  const merged = [...prev, ...data.clusters];
+                  setClusters(merged);
+                  return merged;
+                });
+                
+                // Merge labels
+                const prev = allBatchLabelsRef.current;
+                const prevCount = Object.keys(prev).length > 0 ? Math.max(...Object.keys(prev).map(Number)) + 1 : 0;
+                const newLabels: Record<string, string> = { ...prev };
+                if (data.labels) {
+                  for (const [key, val] of Object.entries(data.labels)) {
+                    newLabels[String(Number(key) + (isFirstBatch ? 0 : prevCount))] = val as string;
+                  }
+                }
+                allBatchLabelsRef.current = newLabels;
+                setLabels(newLabels);
+
+                setJobId(data.job_id);
+                setErrors(prev => [...prev, ...(data.errors || [])]);
+
+                const totalFiles = data.total_files;
+                const newOffset = offset + size;
+                const totalBatches = Math.ceil(totalFiles / size);
+                const currentBatch = Math.floor(offset / size) + 1;
+                
+                setBatchInfo({
+                  totalFiles,
+                  currentOffset: newOffset,
+                  batchSize: size,
+                  currentBatchNum: currentBatch,
+                  totalBatches,
+                });
+                setCacheTotal(totalFiles);
+
+                setProgress({
+                  phase: 'done',
+                  current: data.clusters.length,
+                  total: data.clusters.length,
+                  message: `Batch ${currentBatch}/${totalBatches} done! ${data.clusters.length} clusters in this batch.`,
+                });
+              }
+            } catch {
+              // ignore
+            }
+          }
+        }
+      }
+    } catch (err: any) {
+      console.error(err);
+      alert(err.message || 'Error processing batch.');
+      setProgress(null);
+    } finally {
+      setLoading(false);
+    }
+  }, [enableCallerTune]);
+
   const handleProcess = async () => {
     if (inputMode === 'excel' && excelFile) {
       const formData = new FormData();
@@ -107,6 +236,164 @@ export default function App() {
         JSON.stringify({ text: urls, enable_caller_tune: enableCallerTune }),
         { 'Content-Type': 'application/json' }
       );
+    } else if (inputMode === 'batch') {
+      await processBatchSSE(0, batchSize, true);
+    }
+  };
+
+  const handleNextBatch = async () => {
+    if (!batchInfo) return;
+    if (batchInfo.currentOffset >= batchInfo.totalFiles) return;
+    await processBatchSSE(batchInfo.currentOffset, batchInfo.batchSize, false);
+  };
+
+  const handlePrevBatch = async () => {
+    if (!batchInfo) return;
+    await processBatchSSE(0, batchInfo.batchSize, true);
+  };
+
+  const fetchCacheInfo = async () => {
+    setLoadingCache(true);
+    try {
+      const res = await fetch('http://localhost:8000/api/cache-files');
+      const data = await res.json();
+      setCacheTotal(data.total_cached_files || data.total);
+    } catch (err) {
+      console.error('Failed to fetch cache info:', err);
+      setCacheTotal(0);
+    } finally {
+      setLoadingCache(false);
+    }
+  };
+
+  const processImportSSE = async (file: File) => {
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      if (!parsed.clusters || !Array.isArray(parsed.clusters)) {
+        alert("Invalid JSON format. Must contain a 'clusters' array.");
+        return;
+      }
+      
+      const defaultName = file.name.replace('.json', '');
+      const name = prompt("Enter a name for this imported batch:", defaultName) || defaultName;
+
+      const payload = {
+        name,
+        clusters: parsed.clusters,
+        labels: parsed.labels || {}
+      };
+
+      setLoading(true);
+      setClusters(null);
+      setProgress({ phase: 'starting', current: 0, total: 1, message: 'Starting import...' });
+
+      const response = await fetch('http://localhost:8000/api/import-batch-stream', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to import batch');
+      }
+
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      if (!reader) throw new Error('No response body');
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('data:')) {
+            const dataStr = line.slice(5).trim();
+            if (dataStr === 'ping') continue;
+
+            try {
+              const data = JSON.parse(dataStr);
+              if (data.phase) {
+                setProgress(data);
+              } else if (data.batch_name) {
+                setProgress({ phase: 'done', current: 1, total: 1, message: data.message });
+                // We're done downloading!
+                await fetchSavedBatches();
+                await loadSavedBatch(data.batch_name);
+                setInputMode('saved');
+              }
+            } catch {}
+          }
+        }
+      }
+    } catch (err: any) {
+      console.error(err);
+      alert(err.message || "Failed to import");
+    } finally {
+      setLoading(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  const handleImportFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    processImportSSE(file);
+  };
+
+  const fetchSavedBatches = async () => {
+    try {
+      const res = await fetch('http://localhost:8000/api/saved-batches');
+      const data = await res.json();
+      setSavedBatches(data.batches);
+    } catch (err) {
+      console.error('Failed to fetch saved batches:', err);
+    }
+  };
+
+  const loadSavedBatch = async (name: string) => {
+    setLoading(true);
+    setClusters(null);
+    setViewingBatchName(name);
+    try {
+      const res = await fetch(`http://localhost:8000/api/saved-batches/${name}`);
+      if (!res.ok) throw new Error('Failed to load batch');
+      const data = await res.json();
+      setClusters(data.clusters);
+      setLabels(data.labels || {});
+      setJobId(name);
+    } catch (err) {
+      alert(err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSaveBatch = async () => {
+    if (!clusters) return;
+    const name = prompt("Enter a name for this batch:", `batch_${new Date().getTime()}`);
+    if (!name) return;
+    
+    try {
+      const res = await fetch('http://localhost:8000/api/saved-batches', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, clusters, labels })
+      });
+      if (res.ok) {
+        alert('Saved successfully!');
+        if (inputMode === 'saved') fetchSavedBatches();
+      } else {
+        alert('Failed to save');
+      }
+    } catch (err) {
+      alert(err);
     }
   };
 
@@ -114,7 +401,6 @@ export default function App() {
     const newLabels = { ...labels, [String(clusterIdx)]: label };
     setLabels(newLabels);
 
-    // Persist to backend
     if (jobId) {
       try {
         await fetch(`http://localhost:8000/api/labels/${jobId}`, {
@@ -148,7 +434,11 @@ export default function App() {
     }
   };
 
-  const canProcess = inputMode === 'paste' ? urls.trim().length > 0 : excelFile !== null;
+  const canProcess = inputMode === 'paste'
+    ? urls.trim().length > 0
+    : inputMode === 'excel'
+      ? excelFile !== null
+      : cacheTotal !== null && cacheTotal > 0;
 
   return (
     <div className="min-h-screen bg-[#0b0c10] text-gray-200 p-6 md:p-8 flex flex-col font-sans">
@@ -190,6 +480,34 @@ export default function App() {
               <FileSpreadsheet size={14} />
               Upload Excel
             </button>
+            <button
+              onClick={() => {
+                setInputMode('batch');
+                if (cacheTotal === null) fetchCacheInfo();
+              }}
+              className={`flex-1 flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg text-xs font-semibold transition-all ${
+                inputMode === 'batch'
+                  ? 'bg-amber-500/20 text-amber-300 shadow-sm'
+                  : 'text-gray-500 hover:text-gray-400'
+              }`}
+            >
+              <Database size={14} />
+              Batch Cache
+            </button>
+            <button
+              onClick={() => {
+                setInputMode('saved');
+                fetchSavedBatches();
+              }}
+              className={`flex-1 flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg text-xs font-semibold transition-all ${
+                inputMode === 'saved'
+                  ? 'bg-purple-500/20 text-purple-300 shadow-sm'
+                  : 'text-gray-500 hover:text-gray-400'
+              }`}
+            >
+              <Bookmark size={14} />
+              Saved Pages
+            </button>
           </div>
 
           {/* Caller Tune Toggle */}
@@ -218,12 +536,138 @@ export default function App() {
               onChange={(e) => setUrls(e.target.value)}
               disabled={loading}
             />
-          ) : (
+          ) : inputMode === 'excel' ? (
             <div className="flex-1 flex flex-col justify-center">
               <ExcelUpload
                 onFileSelected={(file) => setExcelFile(file)}
                 disabled={loading}
               />
+            </div>
+          ) : inputMode === 'batch' ? (
+            /* Batch from Cache panel */
+            <div className="flex-1 flex flex-col gap-4">
+              {/* Cache status */}
+              <div className="bg-amber-500/10 border border-amber-500/20 rounded-xl p-4">
+                <div className="flex items-center justify-between mb-2">
+                  <h3 className="text-sm font-semibold text-amber-300 flex items-center gap-2">
+                    <Database size={16} />
+                    Audio Cache
+                  </h3>
+                  <button
+                    onClick={fetchCacheInfo}
+                    disabled={loadingCache}
+                    className="text-xs text-amber-400 hover:text-amber-300 transition-colors"
+                  >
+                    {loadingCache ? 'Scanning...' : 'Refresh'}
+                  </button>
+                </div>
+                {cacheTotal !== null ? (
+                  <p className="text-2xl font-bold text-amber-200">{cacheTotal.toLocaleString()} <span className="text-sm font-normal text-amber-400">files cached</span></p>
+                ) : (
+                  <p className="text-sm text-gray-500">Click Refresh to scan cache...</p>
+                )}
+              </div>
+
+              {/* Batch size selector */}
+              <div className="bg-white/5 rounded-xl p-4 border border-white/10">
+                <label className="text-xs font-medium text-gray-400 block mb-2">Batch Size</label>
+                <div className="grid grid-cols-4 gap-2">
+                  {[1000, 2000, 5000, 10000].map(size => (
+                    <button
+                      key={size}
+                      onClick={() => setBatchSize(size)}
+                      className={`py-2 rounded-lg text-xs font-bold transition-all ${
+                        batchSize === size
+                          ? 'bg-amber-500/30 text-amber-200 border border-amber-500/50'
+                          : 'bg-white/5 text-gray-500 border border-white/10 hover:border-white/20 hover:text-gray-400'
+                      }`}
+                    >
+                      {(size / 1000).toFixed(0)}k
+                    </button>
+                  ))}
+                </div>
+                {cacheTotal !== null && (
+                  <p className="text-[10px] text-gray-600 mt-2">
+                    {Math.ceil(cacheTotal / batchSize)} batch{Math.ceil(cacheTotal / batchSize) > 1 ? 'es' : ''} of {batchSize.toLocaleString()} files each
+                  </p>
+                )}
+              </div>
+
+              {/* Batch navigation */}
+              {batchInfo && !loading && (
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={handlePrevBatch}
+                    disabled={loading || batchInfo.currentBatchNum <= 1}
+                    className="flex-1 flex items-center justify-center gap-1 py-2.5 rounded-xl text-xs font-semibold bg-white/5 border border-white/10 text-gray-400 hover:bg-white/10 hover:text-gray-300 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+                  >
+                    <ChevronLeft size={14} />
+                    Restart
+                  </button>
+                  <div className="text-center text-xs text-gray-500 px-2">
+                    <span className="text-amber-300 font-bold">{batchInfo.currentBatchNum}</span>
+                    <span className="mx-1">/</span>
+                    <span>{batchInfo.totalBatches}</span>
+                  </div>
+                  <button
+                    onClick={handleNextBatch}
+                    disabled={loading || batchInfo.currentOffset >= batchInfo.totalFiles}
+                    className="flex-1 flex items-center justify-center gap-1 py-2.5 rounded-xl text-xs font-semibold bg-amber-500/20 border border-amber-500/40 text-amber-300 hover:bg-amber-500/30 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+                  >
+                    Next Batch
+                    <ChevronRight size={14} />
+                  </button>
+                </div>
+              )}
+            </div>
+          ) : (
+            /* Saved Pages panel */
+            <div className="flex-1 flex flex-col gap-4">
+              <div className="bg-purple-500/10 border border-purple-500/20 rounded-xl p-4">
+                <div className="flex items-center justify-between mb-2">
+                  <h3 className="text-sm font-semibold text-purple-300 flex items-center gap-2">
+                    <Bookmark size={16} />
+                    Saved Batches
+                  </h3>
+                  <div className="flex items-center gap-3">
+                    <input
+                      type="file"
+                      accept=".json"
+                      ref={fileInputRef}
+                      onChange={handleImportFile}
+                      className="hidden"
+                    />
+                    <button
+                      onClick={() => fileInputRef.current?.click()}
+                      className="text-xs text-purple-400 hover:text-purple-300 transition-colors flex items-center gap-1"
+                    >
+                      <Upload size={14} />
+                      Import
+                    </button>
+                    <button
+                      onClick={fetchSavedBatches}
+                      className="text-xs text-purple-400 hover:text-purple-300 transition-colors"
+                    >
+                      Refresh
+                    </button>
+                  </div>
+                </div>
+                {savedBatches.length > 0 ? (
+                  <div className="mt-4 flex flex-col gap-2 max-h-[300px] overflow-y-auto">
+                    {savedBatches.map(name => (
+                      <button
+                        key={name}
+                        onClick={() => loadSavedBatch(name)}
+                        className="text-left px-3 py-2 bg-white/5 hover:bg-white/10 rounded-lg text-sm text-gray-300 border border-white/5 transition-all"
+                      >
+                        {name}
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-sm text-gray-500 mt-2">No saved batches found.</p>
+                )}
+              </div>
             </div>
           )}
 
@@ -241,21 +685,34 @@ export default function App() {
           <button
             onClick={handleProcess}
             disabled={loading || !canProcess}
-            className="w-full bg-cyan-500 hover:bg-cyan-400 text-[#0b0c10] font-bold py-3 px-6 rounded-xl transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2 shadow-[0_0_20px_rgba(34,211,238,0.15)] hover:shadow-[0_0_30px_rgba(34,211,238,0.3)] active:scale-[0.98]"
+            className={`w-full font-bold py-3 px-6 rounded-xl transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2 active:scale-[0.98] ${
+              inputMode === 'batch'
+                ? 'bg-amber-500 hover:bg-amber-400 text-[#0b0c10] shadow-[0_0_20px_rgba(245,158,11,0.15)] hover:shadow-[0_0_30px_rgba(245,158,11,0.3)]'
+                : 'bg-cyan-500 hover:bg-cyan-400 text-[#0b0c10] shadow-[0_0_20px_rgba(34,211,238,0.15)] hover:shadow-[0_0_30px_rgba(34,211,238,0.3)]'
+            }`}
           >
-            {loading ? <RefreshCw className="animate-spin" size={18} /> : <FileAudio size={18} />}
-            {loading ? 'Processing...' : 'Cluster Audio'}
+            {loading ? <RefreshCw className="animate-spin" size={18} /> : inputMode === 'batch' ? <Database size={18} /> : inputMode === 'saved' ? <Bookmark size={18} /> : <FileAudio size={18} />}
+            {loading ? 'Processing...' : inputMode === 'batch' ? `Process Batch (${batchSize.toLocaleString()} files)` : inputMode === 'saved' ? 'Load a Saved Page' : 'Cluster Audio'}
           </button>
 
-          {/* Export button */}
+          {/* Export and Save buttons */}
           {clusters && jobId && (
-            <button
-              onClick={handleExport}
-              className="w-full bg-white/5 hover:bg-white/10 border border-white/10 hover:border-white/20 text-gray-300 font-semibold py-2.5 px-6 rounded-xl transition-all flex items-center justify-center gap-2"
-            >
-              <Download size={16} />
-              Download CSV
-            </button>
+            <div className="flex gap-2">
+              <button
+                onClick={handleExport}
+                className="flex-1 bg-white/5 hover:bg-white/10 border border-white/10 hover:border-white/20 text-gray-300 font-semibold py-2.5 px-4 rounded-xl transition-all flex items-center justify-center gap-2 text-sm"
+              >
+                <Download size={16} />
+                Download CSV
+              </button>
+              <button
+                onClick={handleSaveBatch}
+                className="flex-1 bg-purple-500/20 hover:bg-purple-500/30 border border-purple-500/30 text-purple-300 font-semibold py-2.5 px-4 rounded-xl transition-all flex items-center justify-center gap-2 text-sm"
+              >
+                <Save size={16} />
+                Save Result
+              </button>
+            </div>
           )}
 
           {/* Error summary */}
@@ -263,6 +720,18 @@ export default function App() {
             <div className="bg-red-500/10 border border-red-500/20 rounded-xl p-3">
               <p className="text-xs text-red-400 font-semibold mb-1">⚠ {errors.length} download error{errors.length > 1 ? 's' : ''}</p>
               <p className="text-[10px] text-red-400/60">Some files couldn't be downloaded. They won't appear in clusters.</p>
+            </div>
+          )}
+
+          {/* Batch accumulation summary */}
+          {inputMode === 'batch' && allBatchClusters.length > 0 && !loading && (
+            <div className="bg-emerald-500/10 border border-emerald-500/20 rounded-xl p-3">
+              <p className="text-xs text-emerald-400 font-semibold mb-1">
+                📊 {allBatchClusters.length} clusters accumulated
+              </p>
+              <p className="text-[10px] text-emerald-400/60">
+                Across {batchInfo?.currentBatchNum || 1} batch{(batchInfo?.currentBatchNum || 1) > 1 ? 'es' : ''}
+              </p>
             </div>
           )}
         </div>
@@ -285,6 +754,7 @@ export default function App() {
                   onLabelChange={handleLabelChange}
                   playingUrl={selectedAudio}
                   jobId={jobId}
+                  batchName={viewingBatchName || jobId}
                 />
               </div>
             </>
