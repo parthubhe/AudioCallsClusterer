@@ -77,6 +77,7 @@ class ImportBatchRequest(BaseModel):
     name: str
     clusters: List[List[str]]
     labels: Dict[str, str] = {}
+    skip_download: bool = False
 
 class ClusterResponse(BaseModel):
     job_id: str
@@ -587,33 +588,44 @@ async def import_batch_stream(request: ImportBatchRequest):
         })
 
     async def event_generator():
-        # Yield an initial progress message
-        await queue.put({
-            "event": "progress",
-            "data": json.dumps({
-                "phase": "starting", "current": 0, "total": len(urls_list),
-                "message": f"Scanning cache for {len(urls_list)} files..."
+        if request.skip_download:
+            results, errors = [], []
+            await queue.put({
+                "event": "progress",
+                "data": json.dumps({
+                    "phase": "skipping", "current": len(urls_list), "total": len(urls_list),
+                    "message": "Skipping audio download as requested."
+                })
             })
-        })
+            await asyncio.sleep(0.5)  # small delay for UI to register
+        else:
+            # Yield an initial progress message
+            await queue.put({
+                "event": "progress",
+                "data": json.dumps({
+                    "phase": "starting", "current": 0, "total": len(urls_list),
+                    "message": f"Scanning cache for {len(urls_list)} files..."
+                })
+            })
 
-        # Start download task
-        task = asyncio.create_task(
-            download_all(urls_list, concurrency=20, progress_callback=progress_callback)
-        )
+            # Start download task
+            task = asyncio.create_task(
+                download_all(urls_list, concurrency=20, progress_callback=progress_callback)
+            )
 
-        while not task.done():
-            try:
-                event = await asyncio.wait_for(queue.get(), timeout=0.5)
+            while not task.done():
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=0.5)
+                    yield event
+                except asyncio.TimeoutError:
+                    yield {"event": "heartbeat", "data": "ping"}
+            
+            # Drain remaining events
+            while not queue.empty():
+                event = await queue.get()
                 yield event
-            except asyncio.TimeoutError:
-                yield {"event": "heartbeat", "data": "ping"}
-        
-        # Drain remaining events
-        while not queue.empty():
-            event = await queue.get()
-            yield event
 
-        results, errors = task.result()
+            results, errors = task.result()
 
         # 2. Save the batch to saved_batches/
         import re
@@ -756,13 +768,20 @@ async def audio_proxy(url: str):
     url_hash = hashlib.md5(url.encode()).hexdigest()
     cached = CACHE_DIR / f"{url_hash}.wav"
     
-    if cached.exists():
-        filename = url.split("/")[-1]
-        return FileResponse(
-            str(cached),
-            media_type="audio/wav",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-        )
+    if not cached.exists() or cached.stat().st_size == 0:
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=30) as resp:
+                    resp.raise_for_status()
+                    data = await resp.read()
+                    cached.write_bytes(data)
+        except Exception as e:
+            raise HTTPException(status_code=404, detail=f"Failed to download audio file on demand: {e}")
     
-    # If not cached, return a redirect or error
-    raise HTTPException(status_code=404, detail="Audio file not found in cache. Run clustering first.")
+    filename = url.split("/")[-1]
+    return FileResponse(
+        str(cached),
+        media_type="audio/wav",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )

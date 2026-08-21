@@ -183,7 +183,8 @@ export default function AudioPlayer({ src, onClose }: AudioPlayerProps) {
         {/* Hidden Audio Element */}
         <audio 
           ref={audioRef} 
-          src={src} 
+          src={`http://localhost:8000/api/audio-proxy?url=${encodeURIComponent(src)}`} 
+
           onEnded={() => setIsPlaying(false)}
           onPause={() => setIsPlaying(false)}
           onPlay={() => setIsPlaying(true)}

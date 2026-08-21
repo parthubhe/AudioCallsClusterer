@@ -278,10 +278,13 @@ export default function App() {
       const defaultName = file.name.replace('.json', '');
       const name = prompt("Enter a name for this imported batch:", defaultName) || defaultName;
 
+      const skipDownload = window.confirm("Skip downloading all audio files? (If skipped, files will only download on demand when you play them)");
+
       const payload = {
         name,
         clusters: parsed.clusters,
-        labels: parsed.labels || {}
+        labels: parsed.labels || {},
+        skip_download: skipDownload
       };
 
       setLoading(true);
