@@ -47,11 +47,19 @@ def load_job(job_id: str) -> dict:
     """Load job from disk if not in memory."""
     if job_id in jobs:
         return jobs[job_id]
+    
     path = JOBS_DIR / f"{job_id}.json"
     if path.exists():
         with open(path) as f:
             jobs[job_id] = json.load(f)
         return jobs[job_id]
+    
+    saved_path = SAVED_BATCHES_DIR / f"{job_id}.json"
+    if saved_path.exists():
+        with open(saved_path) as f:
+            jobs[job_id] = json.load(f)
+        return jobs[job_id]
+        
     return None
 
 # ----- Request/Response models -----
@@ -733,6 +741,9 @@ async def export_callertunes(job_id: str):
     
     export_dir = Path("./exported_callertunes")
     export_dir.mkdir(exist_ok=True)
+    
+    # Pre-download any missing files in case this was a skip-download import
+    await download_all(cluster_urls, concurrency=15)
     
     copied_count = 0
     errors = []
